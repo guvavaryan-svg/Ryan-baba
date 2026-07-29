@@ -1,0 +1,344 @@
+//+------------------------------------------------------------------+
+//| Team1_PRO_V4.4_FINAL_fixed.mq5                                   |
+//| FINAL FIXES: StartEquity + SymbolParse + CSV Robust              |
+//+------------------------------------------------------------------+
+#property strict
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//--- HANDLES + BUFFERS
+int handle_fastMA, handle_slowMA, handle_rsi, handle_atr, handle_adx;
+double fastMA_buf[], slowMA_buf[], rsi_buf[], atr_buf[], adx_buf[];
+MqlRates rates[];
+
+//--- INPUTS
+input double RiskPercent = 1.0;
+input int FastMA = 10; input int SlowMA = 50; input int RSIPeriod = 14;
+input double StopLossPips = 20.0; input double TakeProfitPips = 40.0;
+input double TrailStart = 15.0; input double TrailStep = 5.0; input double BreakEven = 20.0;
+input int MaxSpreadPoints = 30;
+input bool UseDipRip = true; input double DipMultiplier = 1.5; input double RipMultiplier = 1.5; input int RSIDip = 30; input int RSIRip = 70;
+input bool UseMartingale = true; input double MartingaleMultiplier = 2.0; input int MaxMartingaleSteps = 3;
+input bool UseSidewaysFilter = true; input int ADXPeriod = 14; input double ADXThreshold = 20.0; input int ATRPeriod = 14; input double MinATR = 0.00010;
+input int MagicNumber = 12348; input bool TradeOnlyOne = true;
+input double MaxDailyLossPercent = 8.0; input double MaxTotalDrawdownPercent = 10.0; input bool CloseAllOnHalt = true; input bool UseEquityForProtection = true;
+input bool UseTradingHours = true; input int StartHour = 10; input int EndHour = 18;
+input bool UseNewsFilter = true; input bool FilterNewsByCurrency = true; input int MinutesBeforeNews = 30; input int MinutesAfterNews = 30;
+input int CooldownMinutes = 15;
+input bool UseFFNewsCSV = false; input string NewsCSV_FileName = "FFNews.csv";
+
+int news_hours[] = {14, 16}; int news_mins[] = {30, 30};
+double pip_value; double point_value; double stops_level; double freeze_level;
+double equity_peak = 0; double start_balance = 0; double start_equity = 0; // FIX 1
+datetime last_trade_time = 0; int last_day = -1; int martingale_step = 0;
+string base_currency; string quote_currency; // FIX 2
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   handle_fastMA = iMA(_Symbol, PERIOD_CURRENT, FastMA, 0, MODE_EMA, PRICE_CLOSE);
+   handle_slowMA = iMA(_Symbol, PERIOD_CURRENT, SlowMA, 0, MODE_EMA, PRICE_CLOSE);
+   handle_rsi = iRSI(_Symbol, PERIOD_CURRENT, RSIPeriod, PRICE_CLOSE);
+   handle_atr = iATR(_Symbol, PERIOD_CURRENT, ATRPeriod);
+   handle_adx = iADX(_Symbol, PERIOD_CURRENT, ADXPeriod);
+   if(handle_fastMA==INVALID_HANDLE || handle_slowMA==INVALID_HANDLE || handle_rsi==INVALID_HANDLE
+   || handle_atr==INVALID_HANDLE || handle_adx==INVALID_HANDLE) return(INIT_FAILED);
+
+   point_value = _Point;
+   pip_value = (_Digits == 3 || _Digits == 5)? _Point * 10 : _Point;
+   stops_level = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point_value;
+   freeze_level = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL) * point_value;
+
+   ParseSymbolCurrencies(); // FIX 2
+
+   ArraySetAsSeries(fastMA_buf,true); ArraySetAsSeries(slowMA_buf,true);
+   ArraySetAsSeries(rsi_buf,true); ArraySetAsSeries(atr_buf,true);
+   ArraySetAsSeries(adx_buf,true); ArraySetAsSeries(rates,true);
+
+   equity_peak = AccountInfoDouble(ACCOUNT_EQUITY);
+   start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   start_equity = AccountInfoDouble(ACCOUNT_EQUITY); // FIX 1
+   last_day = TimeDay(TimeCurrent());
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(50);
+   Print("V4.4 FINAL STARTED");
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason){ IndicatorRelease(handle_fastMA); IndicatorRelease(handle_slowMA); IndicatorRelease(handle_rsi); IndicatorRelease(handle_atr); IndicatorRelease(handle_adx); }
+
+// Helper: trim spaces from both ends
+string TrimString(string s)
+{
+   int len = StringLen(s);
+   int start = 0;
+   while(start < len && StringGetCharacter(s, start) <= 32) start++;
+   int end = len - 1;
+   while(end >= start && StringGetCharacter(s, end) <= 32) end--;
+   if(start == 0 && end == len - 1) return s;
+   if(end < start) return("");
+   return StringSubstr(s, start, end - start + 1);
+}
+
+// Robust CSV splitter that respects quoted fields
+int SplitCSVLine(const string line, string &fields[])
+{
+   ArrayResize(fields,0);
+   string cur = "";
+   bool inQuotes = false;
+   int L = StringLen(line);
+   for(int i=0; i<L; i++)
+   {
+      string ch = StringSubstr(line, i, 1);
+      if(ch == "\"")
+      {
+         // toggle quote state
+         inQuotes = !inQuotes;
+      }
+      else if(ch == "," && !inQuotes)
+      {
+         int n = ArraySize(fields);
+         ArrayResize(fields, n+1);
+         fields[n] = TrimString(cur);
+         cur = "";
+      }
+      else
+      {
+         cur = cur + ch;
+      }
+   }
+   // push last field
+   int n = ArraySize(fields);
+   ArrayResize(fields, n+1);
+   fields[n] = TrimString(cur);
+   return ArraySize(fields);
+}
+
+// FIX 2: ROBUST SYMBOL PARSER
+void ParseSymbolCurrencies()
+{
+   string name = _Symbol;
+   name = StringToUpper(name); // assign uppercase back
+   // Remove suffixes like .m.a.ecn.pro.r.s
+   int pos = StringFind(name, ".");
+   if(pos >= 0) name = StringSubstr(name, 0, pos);
+
+   if(StringFind(name, "XAU") >= 0){ base_currency = "XAU"; quote_currency = "USD"; return; }
+   if(StringFind(name, "US30") >= 0 || StringFind(name, "DOW") >= 0){ base_currency = "USD"; quote_currency = "USD"; return; }
+   if(StringFind(name, "VOL") >= 0 || StringFind(name, "BOOM") >= 0 || StringFind(name, "CRASH") >= 0){ base_currency = "USD"; quote_currency = "USD"; return; }
+
+   if(StringLen(name) >= 6)
+   {
+      base_currency = StringSubstr(name, 0, 3);
+      quote_currency = StringSubstr(name, 3, 3);
+   }
+}
+
+bool GetIndicators(double &fast, double &slow, double &rsi, double &atr, double &adx, double &price)
+{
+   if(CopyBuffer(handle_fastMA,0,0,2,fastMA_buf)<=0) return false;
+   if(CopyBuffer(handle_slowMA,0,0,2,slowMA_buf)<=0) return false;
+   if(CopyBuffer(handle_rsi,0,0,1,rsi_buf)<=0) return false;
+   if(CopyBuffer(handle_atr,0,0,1,atr_buf)<=0) return false;
+   if(CopyBuffer(handle_adx,0,0,1,adx_buf)<=0) return false;
+   if(CopyRates(_Symbol,PERIOD_CURRENT,0,1,rates)<=0) return false;
+   fast=fastMA_buf[0]; slow=slowMA_buf[0]; rsi=rsi_buf[0]; atr=atr_buf[0]; adx=adx_buf[0]; price=rates[0].close;
+   return true;
+}
+
+// FIX 1: DAILY EQUITY VS DRAWDOWN SEPARATED
+bool EquityProtector()
+{
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   if(dt.day!= last_day)
+   {
+      start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      start_equity = AccountInfoDouble(ACCOUNT_EQUITY); // Save start of day equity
+      equity_peak = AccountInfoDouble(ACCOUNT_EQUITY);
+      last_day = dt.day;
+      martingale_step = 0;
+   }
+   double current_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double current_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+
+   double base_value = UseEquityForProtection? current_equity : current_balance;
+   double base_start = UseEquityForProtection? start_equity : start_balance; // FIX: Use start_equity
+
+   if(current_equity > equity_peak) equity_peak = current_equity;
+   double daily_loss = (base_start - base_value) / base_start * 100.0; // Now correct
+   double drawdown = (equity_peak - current_equity) / equity_peak * 100.0;
+
+   if(daily_loss >= MaxDailyLossPercent || drawdown >= MaxTotalDrawdownPercent)
+   {
+      Comment("HALTED | Daily:",DoubleToString(daily_loss,2),"% DD:",DoubleToString(drawdown,2),"%");
+      if(CloseAllOnHalt) CloseAllPositions();
+      return false;
+   }
+   return true;
+}
+
+void CloseAllPositions(){
+   for(int i=PositionsTotal()-1; i>=0; i--){
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber){
+            bool closed = trade.PositionClose(ticket);
+            if(!closed) Print("CLOSE FAILED: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+         }
+   }
+}
+
+void OnTradeTransaction(const MqlTradeTransaction& trans, const MqlTradeRequest& request, const MqlTradeResult& result)
+{
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   {
+      if(HistoryDealSelect(trans.deal))
+      {
+         if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) == MagicNumber && HistoryDealGetString(trans.deal, DEAL_SYMBOL) == _Symbol && HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+         {
+            double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+            if(profit < 0 && UseMartingale && martingale_step < MaxMartingaleSteps) martingale_step++;
+            else if(profit > 0) martingale_step = 0;
+         }
+      }
+   }
+}
+
+bool CheckTradingHours(){ if(!UseTradingHours) return true; MqlDateTime dt; TimeToStruct(TimeCurrent(), dt); return (dt.hour >= StartHour && dt.hour < EndHour); }
+
+// FIX 4: ROBUST CSV PARSER WITH QUOTES
+bool IsNewsTime()
+{
+   if(!UseNewsFilter) return false;
+   if(UseFFNewsCSV) return CheckFFNewsCSV();
+   datetime server_time = TimeCurrent(); MqlDateTime dt;
+   for(int i=0; i<ArraySize(news_hours); i++){ TimeToStruct(server_time, dt); dt.hour = news_hours[i]; dt.min = news_mins[i]; dt.sec = 0; datetime news_time = StructToTime(dt); double diff_minutes = MathAbs((server_time - news_time) / 60.0); if(diff_minutes <= MinutesBeforeNews) return true; }
+   return false;
+}
+
+bool CheckFFNewsCSV()
+{
+   int file = FileOpen(NewsCSV_FileName, FILE_READ|FILE_TXT|FILE_COMMON); // Read as TXT
+   if(file==INVALID_HANDLE) return false;
+   datetime now = TimeCurrent();
+   string line;
+   // read header (if present) and ignore
+   if(!FileIsEnding(file)) FileReadString(file);
+
+   while(!FileIsEnding(file))
+   {
+      line = FileReadString(file);
+      if(line == "") continue;
+      string parts[];
+      int count = SplitCSVLine(line, parts); // robust CSV split
+      if(count < 4) continue; // at least date,time,currency,impact
+
+      string date_straight = StringReplace(parts[0], "\"", "");
+      string time_straight = StringReplace(parts[1], "\"", "");
+      string currency_straight = StringReplace(parts[2], "\"", "");
+      string impact_straight = StringReplace(parts[3], "\"", "");
+
+      date_straight = TrimString(date_straight);
+      time_straight = TrimString(time_straight);
+      currency_straight = TrimString(currency_straight);
+      impact_straight = TrimString(impact_straight);
+
+      if(FilterNewsByCurrency && currency_straight != "" && currency_straight != base_currency && currency_straight != quote_currency) continue; // FIX 2
+
+      // build a proper date-time string and convert
+      string dt_string = StringConcatenate(date_straight, " ", time_straight);
+      // Print("DEBUG CSV dt_string: '", dt_string, "'"); // enable for debugging the format
+      datetime news_time = StringToTime(dt_string);
+      if(news_time == 0) continue; // skip rows we cannot parse
+
+      if(StringToLower(impact_straight) == "high" && MathAbs(now - news_time) < MinutesBeforeNews * 60)
+      {
+         FileClose(file);
+         return true;
+      }
+   }
+   FileClose(file);
+   return false;
+}
+
+bool CheckSpread(){ double spread_points = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID)) / point_value; return (spread_points <= MaxSpreadPoints); }
+bool IsMarketTrending(){ if(!UseSidewaysFilter) return true; double f,s,r,a,d,p; if(!GetIndicators(f,s,r,a,d,p)) return false; return!(d < ADXThreshold || a < MinATR); }
+
+double CalculateLotSize(double sl_pips)
+{
+   double risk_amount = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0;
+   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE_PROFIT);
+   if(tick_value <= 0) tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double sl_in_price = sl_pips * pip_value;
+   if(sl_in_price == 0 || tick_value == 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lot = risk_amount / (sl_in_price / tick_size * tick_value);
+   if(UseMartingale && martingale_step > 0) lot = lot * MathPow(MartingaleMultiplier, martingale_step);
+   lot = MathFloor(lot / lot_step) * lot_step;
+   return NormalizeDouble(MathMax(MathMin(lot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX)), SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN)), 2);
+}
+
+int CountOurPositions(){ int count=0; for(int i=0; i<PositionsTotal(); i++){ ulong ticket = PositionGetTicket(i); if(ticket > 0 && PositionSelectByTicket(ticket)) if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber) count++; } return count; }
+
+bool CheckSignals(int &signal){ signal = 0; double fast,slow,rsi,atr,adx,price; if(!GetIndicators(fast,slow,rsi,atr,adx,price)) return false; double prev_fast=fastMA_buf[1]; double prev_slow=slowMA_buf[1]; bool ema_cross_up = prev_fast <= prev_slow && fast > slow && rsi > 50; bool ema_cross_dn = prev_fast >= prev_slow && fast < slow && rsi < 50; if(ema_cross_up) signal = 1; if(ema_cross_dn) signal = -1; if(UseDipRip){ double dip_level = slow - atr * DipMultiplier; double rip_level = slow + atr * RipMultiplier; if(price <= dip_level && rsi < RSIDip) signal = 1; if(price >= rip_level && rsi > RSIRip) signal = -1; } return (signal!= 0); }
+
+void OpenTrade(int signal)
+{
+   if(TradeOnlyOne && CountOurPositions() > 0) return;
+   if(TimeCurrent() - last_trade_time < CooldownMinutes * 60) return;
+   double lot = CalculateLotSize(StopLossPips);
+   double sl_price = NormalizeDouble(StopLossPips * pip_value, _Digits);
+   double tp_price = NormalizeDouble(TakeProfitPips * pip_value, _Digits);
+   bool result = false;
+   if(signal == 1){ double price = NormalizeDouble(SymbolInfoDouble(_Symbol, SYMBOL_ASK), _Digits); result = trade.Buy(lot, _Symbol, price, price - sl_price, price + tp_price, "TT4.4_Buy_S"+IntegerToString(martingale_step)); }
+   else if(signal == -1){ double price = NormalizeDouble(SymbolInfoDouble(_Symbol, SYMBOL_BID), _Digits); result = trade.Sell(lot, _Symbol, price, price + sl_price, price - tp_price, "TT4.4_Sell_S"+IntegerToString(martingale_step)); }
+   if(result) last_trade_time = TimeCurrent(); else Print("ORDER FAILED: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+}
+
+// FIX 3: NORMALIZE TP ON MODIFY
+void ManageTrades()
+{
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         {
+            double price_open = PositionGetDouble(POSITION_PRICE_OPEN);
+            double price_current = PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            double profit_pips = MathAbs(price_current - price_open) / pip_value;
+            double sl = PositionGetDouble(POSITION_SL); double tp = NormalizeDouble(PositionGetDouble(POSITION_TP), _Digits); int type = (int)PositionGetInteger(POSITION_TYPE); double new_sl = 0; // FIX 3
+
+            if(profit_pips >= BreakEven) new_sl = NormalizeDouble(price_open, _Digits);
+            if(profit_pips >= TrailStart) new_sl = NormalizeDouble(type == POSITION_TYPE_BUY? price_current - TrailStep * pip_value : price_current + TrailStep * pip_value, _Digits);
+
+            if(new_sl > 0)
+            {
+               double distance = MathAbs(price_current - new_sl);
+               if(distance > stops_level && distance > freeze_level)
+               {
+                  bool mod_result = false;
+                  if(type == POSITION_TYPE_BUY && new_sl > sl) mod_result = trade.PositionModify(ticket, new_sl, tp);
+                  if(type == POSITION_TYPE_SELL && new_sl < sl) mod_result = trade.PositionModify(ticket, new_sl, tp);
+                  if(!mod_result) Print("MODIFY FAILED: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+               }
+            }
+         }
+      }
+   }
+}
+
+void OnTick()
+{
+   if(!EquityProtector()) {Comment("BOT HALTED"); return;}
+   if(!CheckTradingHours()) {Comment("Outside Hours"); return;}
+   if(IsNewsTime()) {Comment("News Pause"); return;}
+   if(!CheckSpread()) {Comment("High Spread"); return;}
+   if(!IsMarketTrending()) {Comment("Sideways Market"); return;}
+   ManageTrades();
+   int signal;
+   if(CheckSignals(signal)) OpenTrade(signal);
+}
+//+------------------------------------------------------------------+            
